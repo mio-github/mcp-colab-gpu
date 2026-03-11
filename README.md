@@ -236,6 +236,16 @@ This fork includes the following security hardening over the original:
 
 **OAuth browser window doesn't open** -- Ensure you're running in an environment with a browser. For headless servers, authenticate on a machine with a browser first and copy the token file.
 
+## Acknowledgments / 謝辞
+
+### English
+
+Special thanks to [Paritosh Dwivedi (@pdwi2020)](https://github.com/pdwi2020) for creating [mcp-server-colab-exec](https://github.com/pdwi2020/mcp-server-colab-exec). Your original idea of bridging MCP-compatible AI assistants with Google Colab GPU runtimes was brilliant and made this extended fork possible. We hope this project helps more developers leverage cloud GPUs from their local AI workflows.
+
+### 日本語
+
+[Paritosh Dwivedi (@pdwi2020)](https://github.com/pdwi2020) 氏の [mcp-server-colab-exec](https://github.com/pdwi2020/mcp-server-colab-exec) に心より感謝いたします。MCP対応のAIアシスタントとGoogle ColabのGPUランタイムを橋渡しするという素晴らしいアイデアと実装のおかげで、この拡張フォークを実現することができました。このプロジェクトが、より多くの開発者がローカルのAIワークフローからクラウドGPUを活用する助けになることを願っています。
+
 ## About the maintainer
 
 Masaya Hirano -- CEO of [Mio System Co., Ltd.](https://miosystem.co.jp), CRO of [TrustedAI Corporation](https://trustedai.co.jp)
