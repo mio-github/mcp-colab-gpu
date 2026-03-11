@@ -1,6 +1,7 @@
 MIT License
 
-Copyright (c) 2026 Paritosh Dwivedi
+Copyright (c) 2026 Paritosh Dwivedi (original mcp-server-colab-exec)
+Copyright (c) 2026 Masaya Hirano (mcp-colab-gpu — extended fork)
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
