@@ -43,6 +43,7 @@ ARTIFACT_B64_START = "ARTIFACT_BASE64_START"
 ARTIFACT_B64_END = "ARTIFACT_BASE64_END"
 
 _job_store = JobStore()
+_background_tasks: set[asyncio.Task] = set()
 
 
 def _wrap_cells(code: str) -> tuple[str, int]:
@@ -214,7 +215,7 @@ async def colab_execute(
         wrapped, num_cells = _wrap_cells(code)
         def _format_bg_result(stdout: str, stderr: str, rc: int) -> str:
             return _format_sync_result(stdout, stderr, rc, num_cells)
-        asyncio.create_task(run_background_job(
+        task = asyncio.create_task(run_background_job(
             _job_store,
             job_id,
             _run_on_colab,
@@ -224,6 +225,8 @@ async def colab_execute(
             timeout=timeout,
             format_result_fn=_format_bg_result,
         ))
+        _background_tasks.add(task)
+        task.add_done_callback(_background_tasks.discard)
         return json.dumps({"job_id": job_id, "status": "starting"})
     if fetch_map or save_map:
         return await asyncio.to_thread(

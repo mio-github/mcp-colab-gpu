@@ -192,17 +192,17 @@ async def run_background_job(
             completed_at=now,
             error=str(exc),
         )
-        logger.error("Background job %s failed: %s", job_id, exc)
+        logger.exception("Background job %s failed: %s", job_id, exc)
     finally:
         _schedule_cleanup(job_store)
 
 
 def _schedule_cleanup(job_store: JobStore) -> None:
     """Schedule deferred cleanup of completed jobs."""
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     loop.call_later(
         CLEANUP_DELAY_SECONDS,
-        lambda: asyncio.ensure_future(_run_cleanup(job_store)),
+        lambda: loop.create_task(_run_cleanup(job_store)),
     )
 
 

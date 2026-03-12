@@ -14,7 +14,6 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
-import pytest_asyncio
 
 from mcp_colab_gpu.background import (
     CLEANUP_DELAY_SECONDS,
