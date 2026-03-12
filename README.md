@@ -183,6 +183,36 @@ Return the mcp-colab-gpu server version. No parameters.
 
 ## Examples
 
+### Just ask in natural language / プロンプトで話しかけるだけ
+
+Once this MCP server is configured, you can use GPU/TPU from any MCP-compatible AI assistant just by asking in natural language. No API calls, no boilerplate -- just describe what you want.
+
+このMCPサーバーを設定すれば、Claude CodeなどのMCP対応AIアシスタントに日本語で話しかけるだけでGPU/TPUが使えます。APIコールもボイラープレートも不要です。
+
+**Claude Code / Claude Desktop / Gemini CLI / Cline:**
+
+> "A100でResNet-50をCIFAR-10で10エポック学習させて、精度を教えて"
+
+> "Train a ResNet-50 on CIFAR-10 for 10 epochs using A100 and report the accuracy"
+
+> "H100でphi-2を動かして、量子コンピューティングについて説明させて"
+
+> "Run phi-2 on H100 and ask it to explain quantum computing"
+
+> "手元のtrain.csvをDriveにアップして、GPUで前処理してから結果をダウンロードして"
+
+> "Upload my local train.csv to Drive, preprocess it on GPU, and download the results"
+
+> "バックグラウンドでStable Diffusionの画像を100枚生成して、終わったら教えて"
+
+> "Generate 100 images with Stable Diffusion in the background and let me know when it's done"
+
+The AI assistant automatically selects the right tool, writes the code, executes it on Colab, and returns the results -- all from a single prompt.
+
+AIアシスタントが適切なツールを自動選択し、コードを書き、Colabで実行し、結果を返します。すべてひとつのプロンプトから。
+
+---
+
 ### Check GPU availability
 
 ```
