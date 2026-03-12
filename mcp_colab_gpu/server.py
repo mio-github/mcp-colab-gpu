@@ -67,9 +67,16 @@ def _parse_cell_output(stdout: str, num_cells: int) -> list[dict]:
 
 
 def _extract_artifact_b64(stdout: str) -> str | None:
+    """Extract base64-encoded artifact data from stdout."""
     pattern = re.escape(ARTIFACT_B64_START) + r"\n(.*?)\n" + re.escape(ARTIFACT_B64_END)
     match = re.search(pattern, stdout, re.DOTALL)
     return match.group(1).strip() if match else None
+
+
+def _strip_artifact_b64(stdout: str) -> str:
+    """Remove the base64 artifact block from stdout to prevent context pollution."""
+    pattern = re.escape(ARTIFACT_B64_START) + r"\n.*?\n" + re.escape(ARTIFACT_B64_END)
+    return re.sub(pattern, "", stdout, flags=re.DOTALL)
 
 
 def _run_on_colab(code: str, accelerator: str, high_memory: bool, timeout: int) -> tuple[str, str, int]:
@@ -265,12 +272,18 @@ else:
     full_code = code + "\n\n" + artifact_code
     wrapped, num_cells = _wrap_cells(full_code)
     stdout, stderr, rc = _run_on_colab(wrapped, accelerator, high_memory, timeout)
-    cells = _parse_cell_output(stdout, num_cells)
+
+    # Extract artifact base64 before stripping it from stdout.
+    b64_data = _extract_artifact_b64(stdout)
+    # Strip the base64 block so it does not leak into cell output JSON,
+    # which would pollute the AI client's context window.
+    clean_stdout = _strip_artifact_b64(stdout)
+
+    cells = _parse_cell_output(clean_stdout, num_cells)
     errors = [c for c in cells if c["status"] != "ok"] if rc != 0 else []
 
     artifact_files = []
     artifacts_zip_path = None
-    b64_data = _extract_artifact_b64(stdout)
     if b64_data:
         try:
             zip_bytes = base64.b64decode(b64_data)
