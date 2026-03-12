@@ -13,6 +13,9 @@ MCP server that allocates Google Colab GPU/TPU runtimes and executes Python code
 | GPU support | T4, L4 | **T4, L4, A100, H100, G4** |
 | TPU support | -- | **V5E1, V6E1** |
 | High-memory runtime | -- | **Supported** |
+| Google Drive integration | -- | **Upload / Download / Fetch / Save** |
+| Background execution | -- | **Non-blocking with poll** |
+| Runtime release | Manual | **Automatic on completion** |
 | Input validation | -- | **Accelerator + timeout validation** |
 | Path traversal protection | -- | **.py-only + resolved symlinks** |
 | Zip slip protection | -- | **Member path validation** |
@@ -69,7 +72,11 @@ Add to your project's `.mcp.json` or `~/.claude/.mcp.json`:
 Or via the CLI:
 
 ```bash
+# Project-local (this project only)
 claude mcp add colab-gpu -- uvx mcp-colab-gpu
+
+# User-global (available in all projects)
+claude mcp add --scope user colab-gpu -- uvx mcp-colab-gpu
 ```
 
 ### Claude Desktop configuration
@@ -99,6 +106,9 @@ Execute inline Python code on a Colab GPU/TPU runtime.
 | `accelerator` | string | `"T4"` | GPU/TPU type: `T4`, `L4`, `A100`, `H100`, `G4`, `V5E1`, `V6E1` |
 | `high_memory` | bool | `false` | Enable high-memory runtime (more RAM) |
 | `timeout` | int | `300` | Max execution time in seconds (10--3600) |
+| `background` | bool | `false` | Run in background (non-blocking). Returns a `job_id` to poll via `colab_poll`. Incompatible with `drive_fetch`/`drive_save`. |
+| `drive_fetch` | string | `""` | JSON mapping Drive paths to Colab paths. Files are downloaded from Google Drive **before** your code runs. Example: `'{"colab_data/train.csv": "/content/train.csv"}'` |
+| `drive_save` | string | `""` | JSON mapping Colab paths to Drive paths. Files are uploaded to Google Drive **after** your code finishes (with a freshly obtained token). Example: `'{"/content/model.pt": "results/model.pt"}'` |
 
 Returns JSON with per-cell output, errors, and stderr.
 
@@ -128,6 +138,48 @@ Execute code and collect all generated artifacts (images, CSVs, models, etc.).
 | `timeout` | int | `300` | Max execution time in seconds (10--3600) |
 
 Artifacts are downloaded as a zip and extracted into `output_dir`.
+
+### `colab_poll`
+
+Poll a background job for its current status and results.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `job_id` | string | -- | The job identifier returned by `colab_execute(..., background=true)` (required) |
+
+Returns JSON with `job_id`, `status` (`starting`, `running`, `completed`, `failed`), `accelerator`, timestamps, and `result` (when completed) or `error` (when failed).
+
+### `colab_jobs`
+
+List all tracked background jobs.
+
+No parameters. Returns a JSON array of job summaries including `job_id`, `status`, `accelerator`, and timestamps.
+
+### `colab_drive_upload`
+
+Upload a local file to Google Drive.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `local_path` | string | -- | Path to the local file to upload (required) |
+| `drive_folder` | string | `"colab_data"` | Target folder path on Google Drive (relative to MyDrive). Nested paths like `data/train` are supported. Folders are created automatically. |
+
+Returns JSON with `drive_file_id`, `filename`, `drive_folder`, and `colab_path`.
+
+### `colab_drive_download`
+
+Download a file from Google Drive to a local path.
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `drive_path` | string | -- | File path on Google Drive relative to MyDrive (e.g. `results/model.pt`) (required) |
+| `local_path` | string | -- | Local destination path (required) |
+
+Returns JSON with `local_path`, `drive_file_id`, and `size_bytes`.
+
+### `colab_version`
+
+Return the mcp-colab-gpu server version. No parameters.
 
 ## Examples
 
@@ -165,6 +217,69 @@ print(f"8192x8192 matmul: {elapsed:.3f}s ({tflops:.1f} TFLOPS)")
     accelerator="A100",
     high_memory=True,
 )
+```
+
+### Background execution with polling
+
+```
+# 1. Start a long-running job in the background
+colab_execute(
+    code="""
+import torch
+model = torch.hub.load('pytorch/vision', 'resnet152', pretrained=True)
+model = model.cuda().eval()
+dummy = torch.randn(64, 3, 224, 224, device='cuda')
+with torch.no_grad():
+    for i in range(100):
+        output = model(dummy)
+print(f"Completed 100 inference batches")
+""",
+    accelerator="A100",
+    background=True,
+)
+# Returns: {"job_id": "abc123def456", "status": "starting"}
+
+# 2. Poll for results
+colab_poll(job_id="abc123def456")
+# Returns: {"job_id": "...", "status": "running", ...}
+
+# 3. When complete
+colab_poll(job_id="abc123def456")
+# Returns: {"job_id": "...", "status": "completed", "result": {...}}
+
+# 4. List all jobs
+colab_jobs()
+# Returns: {"jobs": [...], "count": 1}
+```
+
+### Google Drive: upload data, process on GPU, download results
+
+```
+# 1. Upload training data to Drive
+colab_drive_upload(local_path="./data/train.csv", drive_folder="colab_data")
+
+# 2. Execute on Colab with Drive fetch + save
+colab_execute(
+    code="""
+import pandas as pd
+import torch
+
+df = pd.read_csv('/content/train.csv')
+print(f"Loaded {len(df)} rows")
+
+# ... GPU training ...
+
+torch.save(model.state_dict(), '/content/model.pt')
+print("Model saved")
+""",
+    accelerator="A100",
+    drive_fetch='{"colab_data/train.csv": "/content/train.csv"}',
+    drive_save='{"/content/model.pt": "results/model.pt"}',
+    timeout=600,
+)
+
+# 3. Download results from Drive
+colab_drive_download(drive_path="results/model.pt", local_path="./model.pt")
 ```
 
 ### LLM inference on H100
@@ -212,9 +327,31 @@ print("Model saved!")
 
 ## Authentication
 
+### Colab runtime
+
 On first use, the server opens a browser window for Google OAuth2 consent. The access token and refresh token are cached at `~/.config/colab-exec/token.json`. Subsequent runs use the cached token and refresh it automatically.
 
 The OAuth2 client credentials are the same ones used by the official Google Colab VS Code extension (`google.colab@0.3.0`). They are intentionally public.
+
+### Google Drive (v0.3.0+)
+
+Drive tools (`colab_drive_upload`, `colab_drive_download`, `drive_fetch`, `drive_save`) use a **separate OAuth2 token** with the `drive.file` scope. On first Drive operation, a second browser window opens for consent. The token is cached at `~/.config/colab-exec/drive_token.json`.
+
+This separate token means:
+- Users who only use `colab_execute` are never asked for Drive permissions.
+- Drive access is limited to the `drive.file` scope (only files created by this app).
+
+To use your own OAuth client instead of the built-in one, set the environment variable `MCP_DRIVE_CLIENT_JSON` or place a `drive_client.json` file at `~/.config/colab-exec/drive_client.json`.
+
+## Design: zero CU waste
+
+Colab compute units (CU) are consumed while a runtime is allocated. This server releases runtimes **immediately** after code execution finishes -- not when the client disconnects or the session times out.
+
+- **Sync execution**: allocate -> execute -> release (all in one call)
+- **Background execution**: allocate -> execute -> release on completion (not on poll)
+- **Drive fetch/save**: all three steps (fetch, execute, save) run on the same allocation, released once all steps finish
+
+This means you only pay for actual computation time, never for idle runtimes.
 
 ## Security improvements
 
@@ -222,7 +359,9 @@ This fork includes the following security hardening over the original:
 
 - **Path validation in `colab_execute_file`**: Only `.py` files are accepted. Paths are resolved through `pathlib.Path.resolve()` to prevent symlink-based traversal attacks.
 - **Zip slip protection in `colab_execute_notebook`**: Every member in a downloaded artifact zip is validated to ensure its resolved path stays within the target `output_dir`, preventing directory traversal via crafted zip entries.
-- **Token file permissions**: The OAuth token cache file (`~/.config/colab-exec/token.json`) is created with `0o600` permissions (owner read/write only) using `os.open` instead of plain `open`.
+- **Path traversal protection in Drive operations**: Local paths in `colab_drive_upload` and `colab_drive_download` reject `..` segments to prevent directory traversal.
+- **Drive query injection prevention**: Folder and file names are escaped before being used in Drive API query strings.
+- **Token file permissions**: The OAuth token cache files (`token.json`, `drive_token.json`) are created with `0o600` permissions (owner read/write only) using `os.open` instead of plain `open`.
 - **Input validation**: The `accelerator` parameter is validated against the known set of supported accelerators, and `timeout` is bounded to 10--3600 seconds, before any network calls are made.
 - **Token refresh error logging**: When automatic token refresh fails, the error is logged to stderr with a warning message before falling back to re-authentication, instead of silently discarding the error.
 
@@ -233,6 +372,10 @@ This fork includes the following security hardening over the original:
 **"Timed out creating kernel session"** -- The runtime took too long to start. Retry -- Colab sometimes has delays during peak usage.
 
 **"Authentication failed"** -- Delete `~/.config/colab-exec/token.json` and re-authenticate.
+
+**"Drive authentication failed"** -- Delete `~/.config/colab-exec/drive_token.json` and re-authenticate.
+
+**"A background job is already running"** -- Only one background job can run at a time (Colab single-GPU constraint). Wait for the current job to finish or poll its status with `colab_poll`.
 
 **OAuth browser window doesn't open** -- Ensure you're running in an environment with a browser. For headless servers, authenticate on a machine with a browser first and copy the token file.
 

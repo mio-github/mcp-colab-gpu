@@ -29,7 +29,7 @@ from mcp_colab_gpu.drive import (
     resolve_file_id,
     upload_to_drive,
 )
-from mcp_colab_gpu.server import _ColabRuntime, _execute_with_drive
+from mcp_colab_gpu.server import _execute_with_drive
 
 
 DRIVE_TEST_FOLDER = "mcp_colab_gpu_e2e_test"
