@@ -90,22 +90,40 @@ def _strip_artifact_b64(stdout: str) -> str:
     return re.sub(pattern, "", stdout, flags=re.DOTALL)
 
 
-def _run_on_colab(code: str, accelerator: str, high_memory: bool, timeout: int) -> tuple[str, str, int]:
-    validate_params(accelerator, timeout)
-    creds = get_credentials()
-    access_token = creds.token
-    assignment = allocate_runtime(access_token, accelerator, high_memory)
-    stop_event = start_keepalive(access_token, assignment["endpoint"])
-    try:
-        kernel_id = create_session(assignment["proxy_url"], assignment["proxy_token"])
-        stdout, stderr, exit_code = execute_code(
-            assignment["proxy_url"], assignment["proxy_token"], kernel_id, code,
-            timeout=timeout, access_token=access_token, endpoint=assignment["endpoint"],
+class _ColabRuntime:
+    """Context manager for a Colab GPU runtime lifecycle."""
+
+    def __init__(self, accelerator: str, high_memory: bool, timeout: int):
+        validate_params(accelerator, timeout)
+        self.accelerator = accelerator
+        self.high_memory = high_memory
+        self.timeout = timeout
+
+    def __enter__(self):
+        creds = get_credentials()
+        self.access_token = creds.token
+        self.assignment = allocate_runtime(self.access_token, self.accelerator, self.high_memory)
+        self.stop_event = start_keepalive(self.access_token, self.assignment["endpoint"])
+        self.kernel_id = create_session(self.assignment["proxy_url"], self.assignment["proxy_token"])
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.stop_event.set()
+        unassign_runtime(self.access_token, self.assignment["endpoint"])
+        return False
+
+    def execute(self, code: str, timeout: int | None = None) -> tuple[str, str, int]:
+        return execute_code(
+            self.assignment["proxy_url"], self.assignment["proxy_token"],
+            self.kernel_id, code,
+            timeout=timeout or self.timeout,
+            access_token=self.access_token, endpoint=self.assignment["endpoint"],
         )
-    finally:
-        stop_event.set()
-        unassign_runtime(access_token, assignment["endpoint"])
-    return stdout, stderr, exit_code
+
+
+def _run_on_colab(code: str, accelerator: str, high_memory: bool, timeout: int) -> tuple[str, str, int]:
+    with _ColabRuntime(accelerator, high_memory, timeout) as rt:
+        return rt.execute(code)
 
 
 def _validate_file_path(raw: str) -> pathlib.Path:
@@ -131,12 +149,21 @@ def _safe_extract_zip(zip_path: str, output_dir: str) -> list[str]:
     return artifact_files
 
 
+def _parse_drive_json(raw: str) -> dict[str, str]:
+    """Parse a drive_fetch/drive_save JSON string into a dict."""
+    if not raw:
+        return {}
+    return json.loads(raw)
+
+
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
 def colab_execute(
     code: str,
     accelerator: str = "T4",
     high_memory: bool = False,
     timeout: int = 300,
+    drive_fetch: str = "",
+    drive_save: str = "",
 ) -> str:
     """Execute Python code on a Google Colab GPU/TPU runtime.
 
@@ -157,12 +184,109 @@ def colab_execute(
               "V6E1" - TPU v6e-1 (Colab Pro+)
         high_memory: Enable high-memory runtime (more RAM). Default: False.
         timeout: Max execution time in seconds. Default: 300.
+        drive_fetch: JSON mapping Drive paths to Colab paths. Files are
+            downloaded from Google Drive BEFORE your code runs.
+            Example: '{"colab_data/train.csv": "/content/train.csv"}'
+            Requires prior colab_drive_upload to place files on Drive.
+        drive_save: JSON mapping Colab paths to Drive paths. Files are
+            uploaded to Google Drive AFTER your code finishes, using
+            a freshly obtained token (safe for long-running tasks).
+            Example: '{"/content/model.pt": "results/model.pt"}'
     """
+    fetch_map = _parse_drive_json(drive_fetch)
+    save_map = _parse_drive_json(drive_save)
+
+    if fetch_map or save_map:
+        return _execute_with_drive(code, accelerator, high_memory, timeout, fetch_map, save_map)
+
     wrapped, num_cells = _wrap_cells(code)
     stdout, stderr, rc = _run_on_colab(wrapped, accelerator, high_memory, timeout)
     cells = _parse_cell_output(stdout, num_cells)
     errors = [c for c in cells if c["status"] != "ok"] if rc != 0 else []
     return json.dumps({"cells": cells, "errors": errors, "stderr": stderr, "exit_code": rc}, indent=2)
+
+
+def _execute_with_drive(
+    code: str,
+    accelerator: str,
+    high_memory: bool,
+    timeout: int,
+    fetch_map: dict[str, str],
+    save_map: dict[str, str],
+) -> str:
+    """Execute code on Colab with Drive fetch (pre) and save (post) steps.
+
+    All three steps run on the same runtime allocation:
+    1. [Pre]  Fresh token → download files from Drive to Colab filesystem
+    2. [Main] Execute user code (may run for hours)
+    3. [Post] Fresh token → upload results from Colab filesystem to Drive
+    """
+    import sys
+    from .drive import (
+        generate_drive_fetch_code,
+        generate_drive_save_code,
+        get_drive_credentials,
+        resolve_file_id,
+    )
+
+    drive_errors = []
+
+    with _ColabRuntime(accelerator, high_memory, timeout) as rt:
+        # --- Step 1: Drive fetch (pre-execution) ---
+        if fetch_map:
+            try:
+                drive_creds = get_drive_credentials()
+                file_mappings = []
+                for drive_path, colab_path in fetch_map.items():
+                    fid = resolve_file_id(drive_path, drive_creds)
+                    file_mappings.append({"file_id": fid, "dest_path": colab_path})
+                fetch_code = generate_drive_fetch_code(file_mappings, drive_creds.token)
+                _, fetch_stderr, fetch_rc = rt.execute(fetch_code, timeout=120)
+                if fetch_rc != 0:
+                    drive_errors.append({"drive_fetch_error": fetch_stderr.strip()})
+            except Exception as e:
+                drive_errors.append({"drive_fetch_error": str(e)})
+
+        # --- Step 2: User code ---
+        wrapped, num_cells = _wrap_cells(code)
+        stdout, stderr, rc = rt.execute(wrapped)
+        cells = _parse_cell_output(stdout, num_cells)
+        errors = [c for c in cells if c["status"] != "ok"] if rc != 0 else []
+
+        # --- Step 3: Drive save (post-execution) ---
+        drive_saved = []
+        if save_map and rc == 0:
+            try:
+                drive_creds = get_drive_credentials()
+                save_mappings = []
+                for colab_path, drive_path in save_map.items():
+                    parts = drive_path.strip("/").split("/")
+                    filename = parts[-1]
+                    folder = "/".join(parts[:-1]) if len(parts) > 1 else ""
+                    save_mappings.append({
+                        "local_path": colab_path,
+                        "drive_folder": folder,
+                        "filename": filename,
+                    })
+                save_code = generate_drive_save_code(save_mappings, drive_creds.token)
+                save_stdout, save_stderr, save_rc = rt.execute(save_code, timeout=300)
+                if save_rc != 0:
+                    drive_errors.append({"drive_save_error": save_stderr.strip()})
+                else:
+                    drive_saved = [
+                        {"colab_path": m["local_path"], "drive_path": dp}
+                        for m, dp in zip(save_mappings, save_map.values())
+                    ]
+            except Exception as e:
+                drive_errors.append({"drive_save_error": str(e)})
+
+    result = {
+        "cells": cells, "errors": errors + drive_errors,
+        "stderr": stderr, "exit_code": rc,
+    }
+    if drive_saved:
+        result["drive_saved"] = drive_saved
+    return json.dumps(result, indent=2)
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
