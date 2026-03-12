@@ -74,8 +74,16 @@ def _extract_artifact_b64(stdout: str) -> str | None:
 
 
 def _strip_artifact_b64(stdout: str) -> str:
-    """Remove the base64 artifact block from stdout to prevent context pollution."""
-    pattern = re.escape(ARTIFACT_B64_START) + r"\n.*?\n" + re.escape(ARTIFACT_B64_END)
+    """Remove the base64 artifact block from stdout to prevent context pollution.
+
+    Handles both complete blocks (START...END) and truncated blocks where
+    the end marker is missing due to timeout or mid-execution errors.
+    """
+    pattern = (
+        re.escape(ARTIFACT_B64_START)
+        + r"\n.*?"
+        + r"(?:\n" + re.escape(ARTIFACT_B64_END) + r"|$)"
+    )
     return re.sub(pattern, "", stdout, flags=re.DOTALL)
 
 
