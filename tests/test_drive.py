@@ -212,13 +212,13 @@ class TestDownloadFromDrive:
 
         dl_resp = MagicMock()
         dl_resp.status_code = 200
-        dl_resp.content = b"col1,col2\n1,2\n"
+        dl_resp.iter_content = MagicMock(return_value=[b"col1,col2\n1,2\n"])
         dl_resp.raise_for_status = MagicMock()
 
         with (
             patch("mcp_colab_gpu.drive.requests.get", side_effect=[folder_resp, file_resp, dl_resp]),
         ):
-            result = download_from_drive("results/model.pt", local_path, mock_creds)
+            download_from_drive("results/model.pt", local_path, mock_creds)
 
         assert os.path.exists(local_path)
         with open(local_path, "rb") as f:
@@ -235,7 +235,7 @@ class TestDownloadFromDrive:
             with pytest.raises(FileNotFoundError, match="not found on Google Drive"):
                 download_from_drive("data/missing.csv", local_path, mock_creds)
 
-    def test_download_rejects_path_traversal(self, mock_creds, tmp_path):
+    def test_download_rejects_path_traversal(self, mock_creds):
         """local_path with path traversal should be rejected."""
         with pytest.raises(ValueError, match="Path traversal rejected"):
             download_from_drive("data/file.csv", "/tmp/../../etc/passwd", mock_creds)
@@ -253,7 +253,7 @@ class TestDownloadFromDrive:
 
         dl_resp = MagicMock()
         dl_resp.status_code = 200
-        dl_resp.content = b"hello"
+        dl_resp.iter_content = MagicMock(return_value=[b"hello"])
         dl_resp.raise_for_status = MagicMock()
 
         with patch("mcp_colab_gpu.drive.requests.get", side_effect=[file_resp, dl_resp]):
@@ -262,6 +262,8 @@ class TestDownloadFromDrive:
         assert os.path.exists(local_path)
         with open(local_path, "rb") as f:
             assert f.read() == b"hello"
+        assert result["drive_file_id"] == "file-root"
+        assert result["size"] == 256
 
 
 class TestTokenMaxAge:

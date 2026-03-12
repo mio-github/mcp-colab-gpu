@@ -1,9 +1,11 @@
 """MCP server for executing Python code on Google Colab GPU/TPU runtimes.
 
 Exposes tools via the FastMCP API:
-- colab_execute: Run inline Python code on a Colab GPU/TPU
+- colab_execute: Run inline Python code on a Colab GPU/TPU (sync or background)
 - colab_execute_file: Run a local .py file on a Colab GPU/TPU
 - colab_execute_notebook: Run code and collect generated artifacts
+- colab_poll: Poll a background job for status and results
+- colab_jobs: List all tracked background jobs
 - colab_drive_upload: Upload a local file to Google Drive
 - colab_drive_download: Download a file from Google Drive
 - colab_version: Return the server version
@@ -12,6 +14,7 @@ Original: mcp-server-colab-exec v0.1.0 by Paritosh Dwivedi (MIT License)
 Extended: mcp-colab-gpu by Masaya Hirano --- all Colab Pro GPUs, high-memory, security fixes.
 """
 
+import asyncio
 import base64
 import json
 import os
@@ -21,6 +24,7 @@ import zipfile
 
 from mcp.server.fastmcp import FastMCP
 
+from .background import JobStatus, JobStore, run_background_job
 from .colab_runtime import (
     allocate_runtime,
     create_session,
@@ -37,6 +41,8 @@ CELL_START = "===CELL_START_{n}==="
 CELL_END = "===CELL_END_{n}==="
 ARTIFACT_B64_START = "ARTIFACT_BASE64_START"
 ARTIFACT_B64_END = "ARTIFACT_BASE64_END"
+
+_job_store = JobStore()
 
 
 def _wrap_cells(code: str) -> tuple[str, int]:
@@ -90,40 +96,34 @@ def _strip_artifact_b64(stdout: str) -> str:
     return re.sub(pattern, "", stdout, flags=re.DOTALL)
 
 
-class _ColabRuntime:
-    """Context manager for a Colab GPU runtime lifecycle."""
-
-    def __init__(self, accelerator: str, high_memory: bool, timeout: int):
-        validate_params(accelerator, timeout)
-        self.accelerator = accelerator
-        self.high_memory = high_memory
-        self.timeout = timeout
-
-    def __enter__(self):
-        creds = get_credentials()
-        self.access_token = creds.token
-        self.assignment = allocate_runtime(self.access_token, self.accelerator, self.high_memory)
-        self.stop_event = start_keepalive(self.access_token, self.assignment["endpoint"])
-        self.kernel_id = create_session(self.assignment["proxy_url"], self.assignment["proxy_token"])
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.stop_event.set()
-        unassign_runtime(self.access_token, self.assignment["endpoint"])
-        return False
-
-    def execute(self, code: str, timeout: int | None = None) -> tuple[str, str, int]:
-        return execute_code(
-            self.assignment["proxy_url"], self.assignment["proxy_token"],
-            self.kernel_id, code,
-            timeout=timeout or self.timeout,
-            access_token=self.access_token, endpoint=self.assignment["endpoint"],
-        )
-
-
 def _run_on_colab(code: str, accelerator: str, high_memory: bool, timeout: int) -> tuple[str, str, int]:
-    with _ColabRuntime(accelerator, high_memory, timeout) as rt:
-        return rt.execute(code)
+    """Blocking function that allocates a runtime, executes code, and releases.
+
+    This runs in a thread via asyncio.to_thread() for both sync and background paths.
+    The runtime is ALWAYS released in the finally block.
+    """
+    validate_params(accelerator, timeout)
+    creds = get_credentials()
+    access_token = creds.token
+    assignment = allocate_runtime(access_token, accelerator, high_memory)
+    stop_event = start_keepalive(access_token, assignment["endpoint"])
+    try:
+        kernel_id = create_session(assignment["proxy_url"], assignment["proxy_token"])
+        stdout, stderr, exit_code = execute_code(
+            assignment["proxy_url"], assignment["proxy_token"], kernel_id, code,
+            timeout=timeout, access_token=access_token, endpoint=assignment["endpoint"],
+        )
+    finally:
+        stop_event.set()
+        unassign_runtime(access_token, assignment["endpoint"])
+    return stdout, stderr, exit_code
+
+
+def _format_sync_result(stdout: str, stderr: str, rc: int, num_cells: int) -> str:
+    """Format execution results into the standard JSON response."""
+    cells = _parse_cell_output(stdout, num_cells)
+    errors = [c for c in cells if c["status"] != "ok"] if rc != 0 else []
+    return json.dumps({"cells": cells, "errors": errors, "stderr": stderr, "exit_code": rc}, indent=2)
 
 
 def _validate_file_path(raw: str) -> pathlib.Path:
@@ -157,11 +157,12 @@ def _parse_drive_json(raw: str) -> dict[str, str]:
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
-def colab_execute(
+async def colab_execute(
     code: str,
     accelerator: str = "T4",
     high_memory: bool = False,
     timeout: int = 300,
+    background: bool = False,
     drive_fetch: str = "",
     drive_save: str = "",
 ) -> str:
@@ -184,6 +185,9 @@ def colab_execute(
               "V6E1" - TPU v6e-1 (Colab Pro+)
         high_memory: Enable high-memory runtime (more RAM). Default: False.
         timeout: Max execution time in seconds. Default: 300.
+        background: Run in background (non-blocking). Default: False.
+            When True, returns immediately with a job_id that can be polled
+            via colab_poll. Incompatible with drive_fetch/drive_save.
         drive_fetch: JSON mapping Drive paths to Colab paths. Files are
             downloaded from Google Drive BEFORE your code runs.
             Example: '{"colab_data/train.csv": "/content/train.csv"}'
@@ -195,15 +199,41 @@ def colab_execute(
     """
     fetch_map = _parse_drive_json(drive_fetch)
     save_map = _parse_drive_json(drive_save)
-
+    if background:
+        if fetch_map or save_map:
+            return json.dumps({
+                "error": "background=True is incompatible with drive_fetch/drive_save"
+            })
+        job_id = await _job_store.create_if_no_active(accelerator)
+        if job_id is None:
+            active = await _job_store.active_job_id()
+            return json.dumps({
+                "error": "A background job is already running",
+                "active_job_id": active,
+            })
+        wrapped, num_cells = _wrap_cells(code)
+        def _format_bg_result(stdout: str, stderr: str, rc: int) -> str:
+            return _format_sync_result(stdout, stderr, rc, num_cells)
+        asyncio.create_task(run_background_job(
+            _job_store,
+            job_id,
+            _run_on_colab,
+            code=wrapped,
+            accelerator=accelerator,
+            high_memory=high_memory,
+            timeout=timeout,
+            format_result_fn=_format_bg_result,
+        ))
+        return json.dumps({"job_id": job_id, "status": "starting"})
     if fetch_map or save_map:
-        return _execute_with_drive(code, accelerator, high_memory, timeout, fetch_map, save_map)
-
+        return await asyncio.to_thread(
+            _execute_with_drive, code, accelerator, high_memory, timeout, fetch_map, save_map,
+        )
     wrapped, num_cells = _wrap_cells(code)
-    stdout, stderr, rc = _run_on_colab(wrapped, accelerator, high_memory, timeout)
-    cells = _parse_cell_output(stdout, num_cells)
-    errors = [c for c in cells if c["status"] != "ok"] if rc != 0 else []
-    return json.dumps({"cells": cells, "errors": errors, "stderr": stderr, "exit_code": rc}, indent=2)
+    stdout, stderr, rc = await asyncio.to_thread(
+        _run_on_colab, wrapped, accelerator, high_memory, timeout,
+    )
+    return _format_sync_result(stdout, stderr, rc, num_cells)
 
 
 def _execute_with_drive(
@@ -217,11 +247,10 @@ def _execute_with_drive(
     """Execute code on Colab with Drive fetch (pre) and save (post) steps.
 
     All three steps run on the same runtime allocation:
-    1. [Pre]  Fresh token → download files from Drive to Colab filesystem
+    1. [Pre]  Fresh token -> download files from Drive to Colab filesystem
     2. [Main] Execute user code (may run for hours)
-    3. [Post] Fresh token → upload results from Colab filesystem to Drive
+    3. [Post] Fresh token -> upload results from Colab filesystem to Drive
     """
-    import sys
     from .drive import (
         generate_drive_fetch_code,
         generate_drive_save_code,
@@ -230,8 +259,13 @@ def _execute_with_drive(
     )
 
     drive_errors = []
-
-    with _ColabRuntime(accelerator, high_memory, timeout) as rt:
+    validate_params(accelerator, timeout)
+    creds = get_credentials()
+    access_token = creds.token
+    assignment = allocate_runtime(access_token, accelerator, high_memory)
+    stop_event = start_keepalive(access_token, assignment["endpoint"])
+    try:
+        kernel_id = create_session(assignment["proxy_url"], assignment["proxy_token"])
         # --- Step 1: Drive fetch (pre-execution) ---
         if fetch_map:
             try:
@@ -241,18 +275,24 @@ def _execute_with_drive(
                     fid = resolve_file_id(drive_path, drive_creds)
                     file_mappings.append({"file_id": fid, "dest_path": colab_path})
                 fetch_code = generate_drive_fetch_code(file_mappings, drive_creds.token)
-                _, fetch_stderr, fetch_rc = rt.execute(fetch_code, timeout=120)
+                _, fetch_stderr, fetch_rc = execute_code(
+                    assignment["proxy_url"], assignment["proxy_token"],
+                    kernel_id, fetch_code, timeout=120,
+                    access_token=access_token, endpoint=assignment["endpoint"],
+                )
                 if fetch_rc != 0:
                     drive_errors.append({"drive_fetch_error": fetch_stderr.strip()})
             except Exception as e:
                 drive_errors.append({"drive_fetch_error": str(e)})
-
         # --- Step 2: User code ---
         wrapped, num_cells = _wrap_cells(code)
-        stdout, stderr, rc = rt.execute(wrapped)
+        stdout, stderr, rc = execute_code(
+            assignment["proxy_url"], assignment["proxy_token"],
+            kernel_id, wrapped, timeout=timeout,
+            access_token=access_token, endpoint=assignment["endpoint"],
+        )
         cells = _parse_cell_output(stdout, num_cells)
         errors = [c for c in cells if c["status"] != "ok"] if rc != 0 else []
-
         # --- Step 3: Drive save (post-execution) ---
         drive_saved = []
         if save_map and rc == 0:
@@ -269,7 +309,11 @@ def _execute_with_drive(
                         "filename": filename,
                     })
                 save_code = generate_drive_save_code(save_mappings, drive_creds.token)
-                save_stdout, save_stderr, save_rc = rt.execute(save_code, timeout=300)
+                _save_stdout, save_stderr, save_rc = execute_code(
+                    assignment["proxy_url"], assignment["proxy_token"],
+                    kernel_id, save_code, timeout=300,
+                    access_token=access_token, endpoint=assignment["endpoint"],
+                )
                 if save_rc != 0:
                     drive_errors.append({"drive_save_error": save_stderr.strip()})
                 else:
@@ -279,7 +323,9 @@ def _execute_with_drive(
                     ]
             except Exception as e:
                 drive_errors.append({"drive_save_error": str(e)})
-
+    finally:
+        stop_event.set()
+        unassign_runtime(access_token, assignment["endpoint"])
     result = {
         "cells": cells, "errors": errors + drive_errors,
         "stderr": stderr, "exit_code": rc,
@@ -289,8 +335,59 @@ def _execute_with_drive(
     return json.dumps(result, indent=2)
 
 
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def colab_poll(job_id: str) -> str:
+    """Poll a background job for its current status and results.
+
+    Use this after launching a background execution with
+    colab_execute(..., background=True) to check progress
+    and retrieve results when complete.
+
+    Args:
+        job_id: The job identifier returned by colab_execute.
+    """
+    record = await _job_store.get(job_id)
+    if record is None:
+        return json.dumps({"error": f"Unknown job_id: {job_id}"})
+    info: dict = {
+        "job_id": record.job_id,
+        "status": record.status.value,
+        "accelerator": record.accelerator,
+        "created_at": record.created_at,
+    }
+    if record.completed_at is not None:
+        info["completed_at"] = record.completed_at
+    if record.status == JobStatus.COMPLETED and record.result is not None:
+        info["result"] = json.loads(record.result)
+    if record.status == JobStatus.FAILED and record.error is not None:
+        info["error"] = record.error
+    return json.dumps(info, indent=2)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+async def colab_jobs() -> str:
+    """List all tracked background jobs.
+
+    Returns a JSON array of job summaries including job_id, status,
+    accelerator type, and timestamps.
+    """
+    records = await _job_store.list_all()
+    jobs = []
+    for record in records:
+        entry: dict = {
+            "job_id": record.job_id,
+            "status": record.status.value,
+            "accelerator": record.accelerator,
+            "created_at": record.created_at,
+        }
+        if record.completed_at is not None:
+            entry["completed_at"] = record.completed_at
+        jobs.append(entry)
+    return json.dumps({"jobs": jobs, "count": len(jobs)}, indent=2)
+
+
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
-def colab_execute_file(
+async def colab_execute_file(
     file_path: str,
     accelerator: str = "T4",
     high_memory: bool = False,
@@ -320,17 +417,16 @@ def colab_execute_file(
         resolved = _validate_file_path(file_path)
     except (ValueError, FileNotFoundError) as e:
         return json.dumps({"error": str(e)})
-
     code = resolved.read_text()
     wrapped, num_cells = _wrap_cells(code)
-    stdout, stderr, rc = _run_on_colab(wrapped, accelerator, high_memory, timeout)
-    cells = _parse_cell_output(stdout, num_cells)
-    errors = [c for c in cells if c["status"] != "ok"] if rc != 0 else []
-    return json.dumps({"cells": cells, "errors": errors, "stderr": stderr, "exit_code": rc}, indent=2)
+    stdout, stderr, rc = await asyncio.to_thread(
+        _run_on_colab, wrapped, accelerator, high_memory, timeout,
+    )
+    return _format_sync_result(stdout, stderr, rc, num_cells)
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
-def colab_execute_notebook(
+async def colab_execute_notebook(
     code: str,
     output_dir: str,
     accelerator: str = "T4",
@@ -360,7 +456,6 @@ def colab_execute_notebook(
     """
     output_dir = os.path.expanduser(output_dir)
     os.makedirs(output_dir, exist_ok=True)
-
     artifact_code = '''
 
 # --- colab-exec artifact collection ---
@@ -406,17 +501,16 @@ else:
 '''
     full_code = code + "\n\n" + artifact_code
     wrapped, num_cells = _wrap_cells(full_code)
-    stdout, stderr, rc = _run_on_colab(wrapped, accelerator, high_memory, timeout)
-
+    stdout, stderr, rc = await asyncio.to_thread(
+        _run_on_colab, wrapped, accelerator, high_memory, timeout,
+    )
     # Extract artifact base64 before stripping it from stdout.
     b64_data = _extract_artifact_b64(stdout)
     # Strip the base64 block so it does not leak into cell output JSON,
     # which would pollute the AI client's context window.
     clean_stdout = _strip_artifact_b64(stdout)
-
     cells = _parse_cell_output(clean_stdout, num_cells)
     errors = [c for c in cells if c["status"] != "ok"] if rc != 0 else []
-
     artifact_files = []
     artifacts_zip_path = None
     if b64_data:
@@ -428,7 +522,6 @@ else:
             artifact_files = _safe_extract_zip(artifacts_zip_path, output_dir)
         except Exception as e:
             errors.append({"artifact_error": str(e)})
-
     return json.dumps({
         "cells": cells, "errors": errors, "artifacts_zip": artifacts_zip_path,
         "artifact_files": artifact_files, "stderr": stderr, "exit_code": rc,
@@ -436,7 +529,7 @@ else:
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
-def colab_drive_upload(
+async def colab_drive_upload(
     local_path: str,
     drive_folder: str = "colab_data",
 ) -> str:
@@ -458,7 +551,7 @@ def colab_drive_upload(
 
     try:
         creds = get_drive_credentials()
-        result = upload_to_drive(local_path, drive_folder, creds)
+        result = await asyncio.to_thread(upload_to_drive, local_path, drive_folder, creds)
         return json.dumps({
             "status": "uploaded",
             "drive_file_id": result["id"],
@@ -473,7 +566,7 @@ def colab_drive_upload(
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
-def colab_drive_download(
+async def colab_drive_download(
     drive_path: str,
     local_path: str,
 ) -> str:
@@ -495,7 +588,7 @@ def colab_drive_download(
 
     try:
         creds = get_drive_credentials()
-        result = download_from_drive(drive_path, local_path, creds)
+        result = await asyncio.to_thread(download_from_drive, drive_path, local_path, creds)
         return json.dumps({
             "status": "downloaded",
             "local_path": result["local_path"],
@@ -509,7 +602,7 @@ def colab_drive_download(
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
-def colab_version() -> str:
+async def colab_version() -> str:
     """Return the mcp-colab-gpu server version."""
     from . import __version__
     return json.dumps({"version": __version__})
