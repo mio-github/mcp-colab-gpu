@@ -10,29 +10,53 @@ import mimetypes
 import os
 import pathlib
 import sys
+import time
 
 import requests
 from google.auth.transport.requests import Request as GoogleRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 
-from .colab_runtime import CLIENT_CONFIG, TOKEN_CACHE_DIR
+from .colab_runtime import TOKEN_CACHE_DIR
 
 os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
 
 DRIVE_SCOPES = [
-    "https://www.googleapis.com/auth/colaboratory",
     "https://www.googleapis.com/auth/drive.file",
-    "profile",
-    "email",
 ]
 
 DRIVE_TOKEN_CACHE_PATH = os.path.join(TOKEN_CACHE_DIR, "drive_token.json")
+
+# OAuth2 client credentials for Drive access (Desktop app type).
+# These are intentionally public — same pattern as Colab's "ClientNotSoSecret".
+# The client_id/secret alone cannot access user data; each user must still
+# authenticate with their own Google account and grant consent.
+DRIVE_CLIENT_CONFIG = {
+    "installed": {
+        "client_id": "269125631449-cbel0pvim52pqtqiadq630fntobc8u7g.apps.googleusercontent.com",
+        "project_id": "mcp-colab-gpu",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "client_secret": "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",
+        "redirect_uris": ["http://localhost"],
+    }
+}
+
+# Optional override: users can provide their own OAuth client JSON via
+# environment variable or by placing a file at ~/.config/colab-exec/drive_client.json.
+DRIVE_CLIENT_JSON_PATH = os.environ.get(
+    "MCP_DRIVE_CLIENT_JSON",
+    os.path.join(TOKEN_CACHE_DIR, "drive_client.json"),
+)
 
 DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
 DRIVE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3"
 
 FOLDER_MIME = "application/vnd.google-apps.folder"
+
+# Track when the Drive token was last obtained/refreshed (epoch seconds).
+_last_drive_token_time: float = 0.0
 
 
 def _drive_query_escape(value: str) -> str:
@@ -46,16 +70,52 @@ def get_drive_credentials() -> Credentials:
     Uses a separate token cache from the Colab-only credentials so that
     adding the drive.file scope does not force re-authentication for
     users who only use colab_execute.
+
+    Environment variable ``MCP_DRIVE_TOKEN_MAX_AGE`` (seconds) controls
+    the maximum age of the cached access token.  When set, the token is
+    forcibly refreshed if it was obtained more than *max_age* seconds ago,
+    even when the underlying ``Credentials`` object still reports itself
+    as valid.  This is used for E2E testing with a short TTL (e.g. 60 s).
     """
+    global _last_drive_token_time  # noqa: PLW0603
+
+    max_age_env = os.environ.get("MCP_DRIVE_TOKEN_MAX_AGE")
+    max_token_age: int | None = int(max_age_env) if max_age_env else None
+
     creds = None
 
     if os.path.exists(DRIVE_TOKEN_CACHE_PATH):
         creds = Credentials.from_authorized_user_file(DRIVE_TOKEN_CACHE_PATH, DRIVE_SCOPES)
 
+    # Force refresh if the token is older than max_token_age.
+    if (
+        creds
+        and creds.valid
+        and max_token_age is not None
+        and _last_drive_token_time > 0
+        and (time.time() - _last_drive_token_time) > max_token_age
+    ):
+        print(
+            f"[colab-gpu] Drive token age {time.time() - _last_drive_token_time:.0f}s "
+            f"> max_age {max_token_age}s — forcing refresh",
+            file=sys.stderr,
+        )
+        if creds.refresh_token:
+            try:
+                creds.refresh(GoogleRequest())
+                _save_drive_credentials(creds)
+                _last_drive_token_time = time.time()
+                return creds
+            except Exception:
+                creds = None
+        else:
+            creds = None
+
     if creds and creds.expired and creds.refresh_token:
         try:
             creds.refresh(GoogleRequest())
             _save_drive_credentials(creds)
+            _last_drive_token_time = time.time()
         except Exception as e:
             print(
                 f"[colab-gpu] Warning: Drive token refresh failed ({e}), re-authenticating...",
@@ -64,7 +124,15 @@ def get_drive_credentials() -> Credentials:
             creds = None
 
     if not creds or not creds.valid:
-        flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, DRIVE_SCOPES)
+        # Use external JSON if provided, otherwise fall back to embedded config.
+        if os.path.exists(DRIVE_CLIENT_JSON_PATH):
+            flow = InstalledAppFlow.from_client_secrets_file(
+                DRIVE_CLIENT_JSON_PATH, DRIVE_SCOPES,
+            )
+        else:
+            flow = InstalledAppFlow.from_client_config(
+                DRIVE_CLIENT_CONFIG, DRIVE_SCOPES,
+            )
         creds = flow.run_local_server(
             port=0,
             access_type="offline",
@@ -72,6 +140,11 @@ def get_drive_credentials() -> Credentials:
             success_message="Drive authentication successful! You can close this tab.",
         )
         _save_drive_credentials(creds)
+        _last_drive_token_time = time.time()
+
+    # First call in this process — record the time without forcing refresh.
+    if _last_drive_token_time == 0.0:
+        _last_drive_token_time = time.time()
 
     return creds
 

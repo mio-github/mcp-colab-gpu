@@ -2,10 +2,12 @@
 
 import json
 import os
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from mcp_colab_gpu import drive as drive_mod
 from mcp_colab_gpu.drive import (
     DRIVE_API_BASE,
     DRIVE_UPLOAD_BASE,
@@ -13,6 +15,7 @@ from mcp_colab_gpu.drive import (
     _validate_local_path,
     download_from_drive,
     find_or_create_folder,
+    get_drive_credentials,
     resolve_drive_path,
     upload_to_drive,
 )
@@ -259,3 +262,77 @@ class TestDownloadFromDrive:
         assert os.path.exists(local_path)
         with open(local_path, "rb") as f:
             assert f.read() == b"hello"
+
+
+class TestTokenMaxAge:
+    """Tests for MCP_DRIVE_TOKEN_MAX_AGE forced refresh behaviour."""
+
+    def _make_creds(self):
+        creds = MagicMock()
+        creds.token = "fresh-token"
+        creds.valid = True
+        creds.expired = False
+        creds.refresh_token = "refresh-tok"
+        return creds
+
+    def test_forced_refresh_when_max_age_exceeded(self):
+        """Token is refreshed when _last_drive_token_time exceeds max_age."""
+        creds = self._make_creds()
+
+        # Simulate: token was obtained 120 seconds ago, max_age = 60
+        drive_mod._last_drive_token_time = time.time() - 120
+
+        with (
+            patch.dict(os.environ, {"MCP_DRIVE_TOKEN_MAX_AGE": "60"}),
+            patch("mcp_colab_gpu.drive.os.path.exists", return_value=True),
+            patch(
+                "mcp_colab_gpu.drive.Credentials.from_authorized_user_file",
+                return_value=creds,
+            ),
+            patch("mcp_colab_gpu.drive._save_drive_credentials"),
+        ):
+            result = get_drive_credentials()
+
+        creds.refresh.assert_called_once()
+        assert result is creds
+
+    def test_no_forced_refresh_within_max_age(self):
+        """Token is not refreshed when still within max_age."""
+        creds = self._make_creds()
+
+        # Token obtained 10 seconds ago, max_age = 60
+        drive_mod._last_drive_token_time = time.time() - 10
+
+        with (
+            patch.dict(os.environ, {"MCP_DRIVE_TOKEN_MAX_AGE": "60"}),
+            patch("mcp_colab_gpu.drive.os.path.exists", return_value=True),
+            patch(
+                "mcp_colab_gpu.drive.Credentials.from_authorized_user_file",
+                return_value=creds,
+            ),
+        ):
+            result = get_drive_credentials()
+
+        creds.refresh.assert_not_called()
+        assert result is creds
+
+    def test_no_forced_refresh_without_env_var(self):
+        """Without MCP_DRIVE_TOKEN_MAX_AGE, no forced refresh."""
+        creds = self._make_creds()
+
+        drive_mod._last_drive_token_time = time.time() - 9999
+
+        with (
+            patch.dict(os.environ, {}, clear=False),
+            patch("mcp_colab_gpu.drive.os.path.exists", return_value=True),
+            patch(
+                "mcp_colab_gpu.drive.Credentials.from_authorized_user_file",
+                return_value=creds,
+            ),
+        ):
+            # Ensure env var is not set
+            os.environ.pop("MCP_DRIVE_TOKEN_MAX_AGE", None)
+            result = get_drive_credentials()
+
+        creds.refresh.assert_not_called()
+        assert result is creds
