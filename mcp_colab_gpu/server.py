@@ -18,6 +18,7 @@ import zipfile
 
 from mcp.server.fastmcp import FastMCP
 
+from . import __version__
 from .colab_runtime import (
     allocate_runtime,
     create_session,
@@ -306,6 +307,12 @@ else:
         "cells": cells, "errors": errors, "artifacts_zip": artifacts_zip_path,
         "artifact_files": artifact_files, "stderr": stderr, "exit_code": rc,
     }, indent=2)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+def colab_version() -> str:
+    """Return the mcp-colab-gpu server version."""
+    return json.dumps({"version": __version__})
 
 
 def main():
