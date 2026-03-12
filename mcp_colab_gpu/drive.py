@@ -1,0 +1,286 @@
+"""Google Drive integration for mcp-colab-gpu.
+
+Provides upload/download operations via the Drive API v3.
+Uses a separate token cache with drive.file scope so that
+existing Colab-only authentication is not disrupted.
+"""
+
+import json
+import mimetypes
+import os
+import pathlib
+import sys
+
+import requests
+from google.auth.transport.requests import Request as GoogleRequest
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+
+from .colab_runtime import CLIENT_CONFIG, TOKEN_CACHE_DIR
+
+os.environ.setdefault("OAUTHLIB_RELAX_TOKEN_SCOPE", "1")
+
+DRIVE_SCOPES = [
+    "https://www.googleapis.com/auth/colaboratory",
+    "https://www.googleapis.com/auth/drive.file",
+    "profile",
+    "email",
+]
+
+DRIVE_TOKEN_CACHE_PATH = os.path.join(TOKEN_CACHE_DIR, "drive_token.json")
+
+DRIVE_API_BASE = "https://www.googleapis.com/drive/v3"
+DRIVE_UPLOAD_BASE = "https://www.googleapis.com/upload/drive/v3"
+
+FOLDER_MIME = "application/vnd.google-apps.folder"
+
+
+def _drive_query_escape(value: str) -> str:
+    """Escape a value for use in a Google Drive API query string."""
+    return value.replace("\\", "\\\\").replace("'", "\\'")
+
+
+def get_drive_credentials() -> Credentials:
+    """Load cached Drive credentials or run the browser OAuth2 flow.
+
+    Uses a separate token cache from the Colab-only credentials so that
+    adding the drive.file scope does not force re-authentication for
+    users who only use colab_execute.
+    """
+    creds = None
+
+    if os.path.exists(DRIVE_TOKEN_CACHE_PATH):
+        creds = Credentials.from_authorized_user_file(DRIVE_TOKEN_CACHE_PATH, DRIVE_SCOPES)
+
+    if creds and creds.expired and creds.refresh_token:
+        try:
+            creds.refresh(GoogleRequest())
+            _save_drive_credentials(creds)
+        except Exception as e:
+            print(
+                f"[colab-gpu] Warning: Drive token refresh failed ({e}), re-authenticating...",
+                file=sys.stderr,
+            )
+            creds = None
+
+    if not creds or not creds.valid:
+        flow = InstalledAppFlow.from_client_config(CLIENT_CONFIG, DRIVE_SCOPES)
+        creds = flow.run_local_server(
+            port=0,
+            access_type="offline",
+            prompt="consent",
+            success_message="Drive authentication successful! You can close this tab.",
+        )
+        _save_drive_credentials(creds)
+
+    return creds
+
+
+def _save_drive_credentials(creds: Credentials) -> None:
+    os.makedirs(TOKEN_CACHE_DIR, exist_ok=True)
+    fd = os.open(DRIVE_TOKEN_CACHE_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(creds.to_json())
+
+
+def _drive_headers(creds: Credentials) -> dict:
+    return {"Authorization": f"Bearer {creds.token}"}
+
+
+def find_or_create_folder(
+    name: str,
+    creds: Credentials,
+    parent_id: str | None = None,
+) -> str:
+    """Find a folder by name in Drive, or create it if it doesn't exist.
+
+    Returns the folder ID.
+    """
+    escaped = _drive_query_escape(name)
+    query = f"name='{escaped}' and mimeType='{FOLDER_MIME}' and trashed=false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+
+    resp = requests.get(
+        f"{DRIVE_API_BASE}/files",
+        headers=_drive_headers(creds),
+        params={"q": query, "fields": "files(id,name)", "spaces": "drive"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    files = resp.json().get("files", [])
+
+    if files:
+        return files[0]["id"]
+
+    body = {"name": name, "mimeType": FOLDER_MIME}
+    if parent_id:
+        body["parents"] = [parent_id]
+
+    resp = requests.post(
+        f"{DRIVE_API_BASE}/files",
+        headers={**_drive_headers(creds), "Content-Type": "application/json"},
+        json=body,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()["id"]
+
+
+def resolve_drive_path(drive_folder: str, creds: Credentials) -> str | None:
+    """Resolve a nested folder path (e.g. 'data/train/images') into a folder ID.
+
+    Creates intermediate folders as needed.
+
+    Returns:
+        The final folder ID, or None if drive_folder is empty.
+    """
+    parts = [p for p in drive_folder.strip("/").split("/") if p]
+    parent_id = None
+    for part in parts:
+        parent_id = find_or_create_folder(part, creds, parent_id=parent_id)
+    return parent_id
+
+
+def _validate_local_path(raw: str) -> pathlib.Path:
+    """Resolve and validate a local file path to prevent path traversal."""
+    if ".." in pathlib.PurePosixPath(raw).parts:
+        raise ValueError(f"Path traversal rejected: {raw}")
+    return pathlib.Path(os.path.expanduser(raw)).resolve()
+
+
+def upload_to_drive(
+    local_path: str,
+    drive_folder: str,
+    creds: Credentials,
+) -> dict:
+    """Upload a local file to Google Drive.
+
+    Args:
+        local_path: Path to the local file.
+        drive_folder: Drive folder path (e.g. 'colab_data' or 'data/train').
+                      Empty string uploads to MyDrive root.
+        creds: Google OAuth2 credentials with drive.file scope.
+
+    Returns:
+        Dict with 'id' and 'name' of the uploaded file.
+
+    Raises:
+        FileNotFoundError: If local_path does not exist.
+    """
+    resolved = _validate_local_path(local_path)
+    if not resolved.is_file():
+        raise FileNotFoundError(f"File not found: {resolved}")
+
+    filename = resolved.name
+    content_type = mimetypes.guess_type(str(resolved))[0] or "application/octet-stream"
+
+    metadata = {"name": filename}
+    if drive_folder:
+        folder_id = resolve_drive_path(drive_folder, creds)
+        if folder_id:
+            metadata["parents"] = [folder_id]
+
+    boundary = "colab_gpu_boundary"
+    meta_json = json.dumps(metadata)
+
+    file_data = resolved.read_bytes()
+
+    body = (
+        f"--{boundary}\r\n"
+        f"Content-Type: application/json; charset=UTF-8\r\n\r\n"
+        f"{meta_json}\r\n"
+        f"--{boundary}\r\n"
+        f"Content-Type: {content_type}\r\n\r\n"
+    ).encode("utf-8") + file_data + f"\r\n--{boundary}--".encode("utf-8")
+
+    resp = requests.post(
+        f"{DRIVE_UPLOAD_BASE}/files",
+        headers={
+            **_drive_headers(creds),
+            "Content-Type": f"multipart/related; boundary={boundary}",
+        },
+        params={"uploadType": "multipart", "fields": "id,name,size"},
+        data=body,
+        timeout=300,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def download_from_drive(
+    drive_path: str,
+    local_path: str,
+    creds: Credentials,
+) -> dict:
+    """Download a file from Google Drive to a local path.
+
+    Args:
+        drive_path: Path on Drive relative to MyDrive (e.g. 'results/model.pt').
+        local_path: Local destination path.
+        creds: Google OAuth2 credentials with drive.file scope.
+
+    Returns:
+        Dict with 'local_path', 'drive_file_id', and 'size'.
+
+    Raises:
+        FileNotFoundError: If the file is not found on Drive.
+        ValueError: If local_path contains path traversal.
+    """
+    dest = _validate_local_path(local_path)
+
+    parts = drive_path.strip("/").split("/")
+    filename = parts[-1]
+    folder_parts = parts[:-1]
+
+    escaped_filename = _drive_query_escape(filename)
+    query = f"name='{escaped_filename}' and trashed=false"
+    if folder_parts:
+        parent_id = None
+        for part in folder_parts:
+            escaped_part = _drive_query_escape(part)
+            folder_query = f"name='{escaped_part}' and mimeType='{FOLDER_MIME}' and trashed=false"
+            if parent_id:
+                folder_query += f" and '{parent_id}' in parents"
+            resp = requests.get(
+                f"{DRIVE_API_BASE}/files",
+                headers=_drive_headers(creds),
+                params={"q": folder_query, "fields": "files(id,name)", "spaces": "drive"},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            folders = resp.json().get("files", [])
+            if not folders:
+                raise FileNotFoundError(
+                    f"'{drive_path}' not found on Google Drive (folder '{part}' does not exist)"
+                )
+            parent_id = folders[0]["id"]
+        query += f" and '{parent_id}' in parents"
+
+    resp = requests.get(
+        f"{DRIVE_API_BASE}/files",
+        headers=_drive_headers(creds),
+        params={"q": query, "fields": "files(id,name,size)", "spaces": "drive"},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    files = resp.json().get("files", [])
+
+    if not files:
+        raise FileNotFoundError(f"'{drive_path}' not found on Google Drive")
+
+    file_id = files[0]["id"]
+    file_size = files[0].get("size", "0")
+
+    resp = requests.get(
+        f"{DRIVE_API_BASE}/files/{file_id}",
+        headers=_drive_headers(creds),
+        params={"alt": "media"},
+        timeout=300,
+    )
+    resp.raise_for_status()
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(resp.content)
+
+    return {"local_path": str(dest), "drive_file_id": file_id, "size": int(file_size)}

@@ -1,9 +1,12 @@
 """MCP server for executing Python code on Google Colab GPU/TPU runtimes.
 
-Exposes three tools via the FastMCP API:
+Exposes tools via the FastMCP API:
 - colab_execute: Run inline Python code on a Colab GPU/TPU
 - colab_execute_file: Run a local .py file on a Colab GPU/TPU
 - colab_execute_notebook: Run code and collect generated artifacts
+- colab_drive_upload: Upload a local file to Google Drive
+- colab_drive_download: Download a file from Google Drive
+- colab_version: Return the server version
 
 Original: mcp-server-colab-exec v0.1.0 by Paritosh Dwivedi (MIT License)
 Extended: mcp-colab-gpu by Masaya Hirano --- all Colab Pro GPUs, high-memory, security fixes.
@@ -306,6 +309,86 @@ else:
         "cells": cells, "errors": errors, "artifacts_zip": artifacts_zip_path,
         "artifact_files": artifact_files, "stderr": stderr, "exit_code": rc,
     }, indent=2)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+def colab_drive_upload(
+    local_path: str,
+    drive_folder: str = "colab_data",
+) -> str:
+    """Upload a local file to Google Drive.
+
+    The file will be accessible from Colab via Drive mount:
+      from google.colab import drive
+      drive.mount('/content/drive')
+      # Access at /content/drive/MyDrive/<drive_folder>/<filename>
+
+    Args:
+        local_path: Path to the local file to upload.
+        drive_folder: Target folder path on Google Drive (relative to MyDrive).
+            Nested paths like 'data/train' are supported.
+            Folders are created automatically if they don't exist.
+            Default: "colab_data".
+    """
+    from .drive import get_drive_credentials, upload_to_drive
+
+    try:
+        creds = get_drive_credentials()
+        result = upload_to_drive(local_path, drive_folder, creds)
+        return json.dumps({
+            "status": "uploaded",
+            "drive_file_id": result["id"],
+            "filename": result["name"],
+            "drive_folder": drive_folder,
+            "colab_path": f"/content/drive/MyDrive/{drive_folder}/{result['name']}" if drive_folder else f"/content/drive/MyDrive/{result['name']}",
+        }, indent=2)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Drive upload failed: {e}"})
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+def colab_drive_download(
+    drive_path: str,
+    local_path: str,
+) -> str:
+    """Download a file from Google Drive to a local path.
+
+    Use this to retrieve results saved to Drive by Colab execution:
+      colab_execute(code=\"\"\"
+        import torch
+        torch.save(model, '/content/drive/MyDrive/results/model.pt')
+      \"\"\")
+      colab_drive_download(drive_path='results/model.pt', local_path='./model.pt')
+
+    Args:
+        drive_path: File path on Google Drive relative to MyDrive
+            (e.g. 'results/model.pt' or 'colab_data/output.csv').
+        local_path: Local destination path where the file will be saved.
+    """
+    from .drive import get_drive_credentials, download_from_drive
+
+    try:
+        creds = get_drive_credentials()
+        result = download_from_drive(drive_path, local_path, creds)
+        return json.dumps({
+            "status": "downloaded",
+            "local_path": result["local_path"],
+            "drive_file_id": result["drive_file_id"],
+            "size_bytes": result["size"],
+        }, indent=2)
+    except FileNotFoundError as e:
+        return json.dumps({"error": str(e)})
+    except Exception as e:
+        return json.dumps({"error": f"Drive download failed: {e}"})
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "destructiveHint": False})
+def colab_version() -> str:
+    """Return the mcp-colab-gpu server version."""
+    from . import __version__
+    return json.dumps({"version": __version__})
 
 
 def main():
