@@ -248,7 +248,7 @@ Special thanks to [Paritosh Dwivedi (@pdwi2020)](https://github.com/pdwi2020) fo
 
 ## About the maintainer
 
-Masaya Hirano -- CEO of [Mio System Co., Ltd.](https://miosystem.co.jp), CRO of [TrustedAI Corporation](https://trustedai.co.jp)
+Masaya Hirano -- CEO of [Mio System Co., Ltd.](https://miosys.co.jp/), CRO of [TrustedAI Corporation](https://www.trusted-ai.co/en)
 
 ## License
 
