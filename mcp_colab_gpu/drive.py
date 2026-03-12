@@ -350,11 +350,14 @@ def download_from_drive(
         headers=_drive_headers(creds),
         params={"alt": "media"},
         timeout=300,
+        stream=True,
     )
     resp.raise_for_status()
 
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(resp.content)
+    with dest.open("wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            f.write(chunk)
 
     return {"local_path": str(dest), "drive_file_id": file_id, "size": int(file_size)}
 
@@ -434,7 +437,7 @@ def generate_drive_fetch_code(
         "",
         "def _mcp_drive_fetch(_fid, _dest):",
         "    _mcp_os.makedirs(_mcp_os.path.dirname(_dest) or '.', exist_ok=True)",
-        f"    _r = _mcp_req.get(f'https://www.googleapis.com/drive/v3/files/{{_fid}}?alt=media',",
+        "    _r = _mcp_req.get(f'https://www.googleapis.com/drive/v3/files/{_fid}?alt=media',",
         f"                      headers={{'Authorization': 'Bearer {escaped_token}'}}, timeout=300)",
         "    _r.raise_for_status()",
         "    with open(_dest, 'wb') as _f:",
