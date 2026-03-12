@@ -367,7 +367,8 @@ class TestColabExecuteBackground:
         # Create a first job (won't actually run since _run_on_colab is not mocked to finish)
         with patch("mcp_colab_gpu.server._run_on_colab") as mock_run:
             # Make the first job block so it stays active
-            mock_run.side_effect = lambda *a, **kw: asyncio.get_event_loop().run_until_complete(asyncio.sleep(10))
+            import time as _time
+            mock_run.side_effect = lambda *_a, **_kw: _time.sleep(10)
             first_str = await srv.colab_execute(
                 code="import time; time.sleep(10)",
                 accelerator="T4",
@@ -516,7 +517,7 @@ class TestColabJobs:
             status=JobStatus.COMPLETED,
             completed_at=datetime.now(timezone.utc).isoformat(),
         )
-        second_id = await srv._job_store.create_if_no_active("A100")
+        _second_id = await srv._job_store.create_if_no_active("A100")
         result_str = await srv.colab_jobs()
         result = json.loads(result_str)
         assert result["count"] == 2

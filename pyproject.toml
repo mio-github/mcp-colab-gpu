@@ -1,6 +1,6 @@
 [project]
 name = "mcp-colab-gpu"
-version = "0.2.1"
+version = "0.3.1"
 description = "MCP server for executing Python on Google Colab GPU/TPU runtimes — supports all Colab Pro accelerators (T4/L4/A100/H100/G4) with high-memory option and security hardening. Fork of mcp-server-colab-exec by Paritosh Dwivedi."
 requires-python = ">=3.10"
 license = "MIT"
